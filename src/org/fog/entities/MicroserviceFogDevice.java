@@ -48,6 +48,10 @@ public class MicroserviceFogDevice extends FogDevice {
 
 
     protected ControllerComponent controllerComponent;
+    // Autoscaling fields
+    protected AutoscalingConfig autoscalingConfig;
+    protected AutoscalerCO autoscaler;
+    protected double autoscaleTickSec = 5.0; // Δt_local
 
     protected List<PlacementRequest> placementRequests = new ArrayList<>();
 
@@ -63,6 +67,15 @@ public class MicroserviceFogDevice extends FogDevice {
 
         // for energy consumption update
         sendNow(getId(), FogEvents.RESOURCE_MGMT);
+
+        // initialize autoscaler on FON/FCN devices
+        if (autoscalingConfig == null) {
+            autoscalingConfig = new AutoscalingConfig();
+        }
+        autoscaler = new AutoscalerCO(getId(), autoscalingConfig, autoscaleTickSec);
+        // start telemetry sampling & heartbeat loops
+        send(getId(), autoscaleTickSec, FogEvents.TELEMETRY_REPORT);
+        send(getId(), 15.0, FogEvents.HEARTBEAT_TO_ROOT);
 
     }
 
@@ -92,9 +105,119 @@ public class MicroserviceFogDevice extends FogDevice {
                 processClustering(this.getParentId(), this.getId(), ev);
                 updateCLusterConsInRoutingTable();
                 break;
+            case FogEvents.HEARTBEAT_TO_ROOT:
+                sendHeartbeat();
+                send(getId(), 15.0, FogEvents.HEARTBEAT_TO_ROOT);
+                break;
+            case FogEvents.TELEMETRY_REPORT:
+                telemetryTick();
+                send(getId(), autoscaleTickSec, FogEvents.TELEMETRY_REPORT);
+                break;
+            case FogEvents.AUTOSCALE_TICK:
+                Object data = ev.getData();
+                if (data instanceof AutoscalerCO.ScaleDecision) {
+                    applyScaleDecision((AutoscalerCO.ScaleDecision) data);
+                }
+                break;
             default:
                 super.processOtherEvent(ev);
                 break;
+        }
+    }
+
+    private void telemetryTick() {
+        // Build per-service metrics for modules present on this device
+        // CPU utilization per module VM
+        Map<String, AutoscalingTelemetry.Window> cpuAgg = new HashMap<>();
+        Map<String, AutoscalingTelemetry.Window> memAgg = new HashMap<>();
+        for (Vm vm : getHost().getVmList()) {
+            AppModule m = (AppModule) vm;
+            String svc = m.getName();
+            cpuAgg.computeIfAbsent(svc, k -> new AutoscalingTelemetry.Window(3))
+                    .add(m.getTotalUtilizationOfCpu(CloudSim.clock()));
+            double memFrac = 0;
+            try {
+                memFrac = ((double) m.getCurrentRequestedRam()) / Math.max(1, m.getRam());
+            } catch (Exception ignored) {}
+            memAgg.computeIfAbsent(svc, k -> new AutoscalingTelemetry.Window(3))
+                    .add(memFrac);
+        }
+        for (String svc : cpuAgg.keySet()) {
+            double cpu = cpuAgg.get(svc).avg();
+            double mem = memAgg.getOrDefault(svc, new AutoscalingTelemetry.Window(1)).avg();
+            AutoscalingTelemetry t = new AutoscalingTelemetry(svc, cpu, mem, -1);
+            autoscaler.onTelemetry(t);
+        }
+    }
+
+    private void sendHeartbeat() {
+        ClusterHeartbeat hb = new ClusterHeartbeat();
+        hb.ts = CloudSim.clock();
+        hb.cluster = getName();
+        // capacity from controller component
+        ControllerComponent cc = getControllerComponent();
+        if (cc != null) {
+            Double cpu = cc.getAvailableResource(getId(), ControllerComponent.CPU);
+            Double ram = cc.getAvailableResource(getId(), ControllerComponent.RAM);
+            hb.capacity.cpuFree = cpu == null ? 0 : cpu;
+            hb.capacity.ramFree = ram == null ? 0 : ram;
+            hb.capacity.nodes = 1; // single device acts as cluster in this model
+        }
+        // send to controller (self or parent FON). For simplicity, just log or no-op.
+    }
+
+    private void applyScaleDecision(AutoscalerCO.ScaleDecision d) {
+        String moduleName = d.service;
+        int delta = d.deltaReplicas;
+
+        // find an application containing this module
+        Application app = null;
+        for (Application a : getApplicationMap().values()) {
+            if (a.getModuleByName(moduleName) != null) { app = a; break; }
+        }
+        if (app == null) return;
+
+        int current = 0;
+        String appId = app.getAppId();
+        if (moduleInstanceCount.containsKey(appId) && moduleInstanceCount.get(appId).containsKey(moduleName)) {
+            current = moduleInstanceCount.get(appId).get(moduleName);
+        }
+        AutoscalingConfig.ServiceConfig sc = autoscalingConfig.forService(moduleName);
+
+        if (delta > 0) {
+            int allowed = Math.min(delta, sc.maxReplicas - current);
+            if (allowed <= 0) return;
+            // ensure module exists on device
+            if (!appToModulesMap.containsKey(appId) || !appToModulesMap.get(appId).contains(moduleName)) {
+                sendNow(getId(), FogEvents.APP_SUBMIT, app);
+                sendNow(getId(), FogEvents.LAUNCH_MODULE, new AppModule(app.getModuleByName(moduleName)));
+            }
+            ModuleLaunchConfig cfg = new ModuleLaunchConfig(new AppModule(app.getModuleByName(moduleName)), allowed);
+            sendNow(getId(), FogEvents.LAUNCH_MODULE_INSTANCE, cfg);
+        } else if (delta < 0) {
+            int k = Math.min(-delta, Math.max(0, current - sc.minReplicas));
+            if (k <= 0) return;
+            // reduce instance count
+            ModuleLaunchConfig cfg = new ModuleLaunchConfig(new AppModule(app.getModuleByName(moduleName)), -k);
+            sendNow(getId(), FogEvents.LAUNCH_MODULE_INSTANCE, cfg);
+            int newCount = current - k;
+            if (newCount <= 0) {
+                // remove module VM
+                AppModule vmToRemove = null;
+                for (Vm vm : getHost().getVmList()) {
+                    if (((AppModule) vm).getName().equals(moduleName)) { vmToRemove = (AppModule) vm; break; }
+                }
+                if (vmToRemove != null) {
+                    sendNow(getId(), FogEvents.RELEASE_MODULE, vmToRemove);
+                }
+                // clean local maps
+                if (moduleInstanceCount.containsKey(appId)) {
+                    moduleInstanceCount.get(appId).remove(moduleName);
+                }
+                if (appToModulesMap.containsKey(appId)) {
+                    appToModulesMap.get(appId).remove(moduleName);
+                }
+            }
         }
     }
 

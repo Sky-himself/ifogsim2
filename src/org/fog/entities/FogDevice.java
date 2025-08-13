@@ -1097,7 +1097,7 @@ public class FogDevice extends PowerDatacenter {
         }
     }
 
-    public void setClusterMembers(List clusterList) {
+    public void setClusterMembers(List<Integer> clusterList) {
         this.clusterMembers = clusterList;
     }
 

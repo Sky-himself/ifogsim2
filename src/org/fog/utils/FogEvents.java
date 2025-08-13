@@ -46,4 +46,11 @@ public class FogEvents {
     //---------------------------------------------
     public static final int START_DYNAMIC_CLUSTERING = BASE + 38;
 
+    // Autoscaling additions
+    public static final int TELEMETRY_REPORT = BASE + 39;
+    public static final int HEARTBEAT_TO_ROOT = BASE + 40;
+    public static final int AUTOSCALE_TICK = BASE + 41;
+    public static final int AUTOSCALE_ESCALATION = BASE + 42;
+    public static final int ROOT_DECISION = BASE + 43;
+
 }
